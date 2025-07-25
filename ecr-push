@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+
+try:
+    import boto3
+    import docker
+except ImportError as e:
+    missing = str(e).split("'")[1] if "'" in str(e) else str(e)
+    print(f"Missing required dependency: {missing}.\nInstall all requirements with: pip install -r requirements.txt")
+    import sys
+    sys.exit(1)
+
+import argparse
+import base64
+import logging
+import sys
+import time
+from datetime import timedelta
+from typing import NoReturn, Tuple
+
+HELP_ACCOUNT_NUMBER = "AWS account number (12 digits)"
+HELP_IMAGE_NAME = "Docker image name (e.g., 'my-app')"
+HELP_IMAGE_TAG = "Docker image tag (e.g., 'latest', 'v1.0')"
+HELP_PROFILE = "AWS profile name (e.g., 'default', 'dev', etc.)"
+LOG_AWS_ECR_CLIENT_CREATE = "Could not create AWS ECR client: {e}"
+LOG_CHECKING_ECR_REPOSITORY = "Error checking ECR repository: {e}"
+LOG_DECODE_AUTH_TOKEN = "Could not decode ECR auth token: {e}"
+LOG_DECODE_AUTH_TOKEN_FORMAT = "ECR auth token did not contain the expected ':' separator or password portion."
+LOG_DOCKER_LOGIN = "Docker login failed: {e}"
+LOG_DURING_PUSH = "\n✗ Error during push: {error}"
+LOG_ECR_AUTH_TOKEN_FETCH = "Could not fetch ECR auth token: {e}"
+LOG_FAILED_CREATE_ECR_REPOSITORY = "Failed to create ECR repository: {error}"
+LOG_PUSHING_IMAGE = "Pushing image failed: {e}"
+LOG_TAGGING_IMAGE = "Tagging image failed: {e}"
+PROGRESS_BAR_CHAR = '█'
+PROGRESS_BAR_FORMAT = "\rProgress: [{elapsed}] |{bar}| {percent:.2f}% ({completed}/{total} layers)"
+PROGRESS_BAR_LENGTH = 40
+SUCCESSFULLY_CREATED_ECR_REPOSITORY = "Created ECR repository: {repository_name}"
+SUCCESSFULLY_PUSHED = "\n✓ Successfully pushed {remote_repository}:{image_tag} in {elapsed_str}"
+SUCCESSFULLY_PUSHED_FINAL = "Successfully pushed {local_image} to {remote_repository}:{image_tag}"
+USER_PUSHING_IMAGE = "Pushing {remote_repository}:{image_tag}..."
+
+logging.basicConfig(
+    level=logging.ERROR,
+    format='%(asctime)s - ECR-PUSH ERROR - message: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("ecr-push")
+
+
+def parse_args() -> argparse.Namespace:
+    """Parses command-line arguments for ecr-push."""
+    parser = argparse.ArgumentParser(
+        description="Push a Docker image to AWS ECR.",
+        epilog="""
+            Examples:
+              ecr-push -p myprofile -a 123456789012 -n my-image -t latest
+                Push 'my-image:latest' to AWS ECR using profile 'myprofile' and account 123456789012.
+
+              ecr-push --profile dev --account-number 123456789012 --image-name app --image-tag v1.2
+                Push 'app:v1.2' to ECR with explicit flags.
+            """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('-p', '--profile', required=True, help=HELP_PROFILE)
+    parser.add_argument('-a', '--account-number', required=True, help=HELP_ACCOUNT_NUMBER)
+    parser.add_argument('-n', '--image-name', required=True, help=HELP_IMAGE_NAME)
+    parser.add_argument('-t', '--image-tag', required=True, help=HELP_IMAGE_TAG)
+    return parser.parse_args()
+
+
+def log_and_exit(message: str, exit_code: int = 1) -> NoReturn:
+    """Logs an error message and exits with the given code."""
+    logger.error(message)
+    sys.exit(exit_code)
+
+
+def validate_inputs(args: argparse.Namespace) -> None:
+    """Validates required arguments and raises ValueError if any are missing."""
+    missing = []
+    if not args.profile:
+        missing.append("AWS profile")
+    if not args.account_number:
+        missing.append("AWS account number")
+    if not args.image_name:
+        missing.append("image name")
+    if not args.image_tag:
+        missing.append("image tag")
+    if missing:
+        raise ValueError(f"Missing required input(s): {', '.join(missing)}")
+
+
+def get_aws_ecr_client(profile: str) -> "boto3.client":
+    """Creates and returns a boto3 ECR client for the given AWS profile."""
+    try:
+        session = boto3.Session(profile_name=profile)
+        return session.client("ecr")
+    except Exception as e:
+        log_and_exit(LOG_AWS_ECR_CLIENT_CREATE.format(e=e))
+
+
+def get_repository_name(image_name: str) -> str:
+    """Extract the base repository name from a Docker image name."""
+    return image_name.split('/')[-1]
+
+
+def ensure_ecr_repository(ecr_client: "boto3.client", image_name: str) -> str:
+    """Ensure the ECR repository exists, create it if it doesn't."""
+    repository_name = get_repository_name(image_name)
+    try:
+        ecr_client.describe_repositories(repositoryNames=[repository_name])
+    except ecr_client.exceptions.RepositoryNotFoundException:
+        try:
+            ecr_client.create_repository(
+                repositoryName=repository_name,
+                imageTagMutability='MUTABLE',
+                imageScanningConfiguration={'scanOnPush': True}
+            )
+            print(SUCCESSFULLY_CREATED_ECR_REPOSITORY.format(repository_name=repository_name))
+        except Exception as e:
+            log_and_exit(LOG_FAILED_CREATE_ECR_REPOSITORY.format(error=e))
+    except Exception as e:
+        log_and_exit(LOG_CHECKING_ECR_REPOSITORY.format(e=e))
+    return repository_name
+
+
+def get_ecr_auth_token(ecr_client: "boto3.client", account_number: str) -> dict:
+    """Fetches and returns ECR authorization data for the given account."""
+    try:
+        auth = ecr_client.get_authorization_token(registryIds=[account_number])
+        return auth["authorizationData"][0]
+    except Exception as e:
+        log_and_exit(LOG_ECR_AUTH_TOKEN_FETCH.format(e=e))
+
+
+def decode_auth_token(auth_token: str) -> str:
+    """Decodes the ECR auth token and returns the password portion."""
+    try:
+        decoded = base64.b64decode(auth_token).decode()
+        parts = decoded.split(":")
+        if len(parts) != 2 or not parts[1]:
+            log_and_exit(LOG_DECODE_AUTH_TOKEN_FORMAT)
+        return parts[1]
+    except Exception as e:
+        log_and_exit(LOG_DECODE_AUTH_TOKEN.format(e=e))
+
+
+def format_image_names(image_name: str, image_tag: str, registry: str) -> Tuple[str, str]:
+    """Formats and returns the local image reference and remote repository path."""
+    local_image = f"{image_name}:{image_tag}"
+    remote_repository = f"{registry.replace('https://', '')}/{image_name}"
+    return local_image, remote_repository
+
+
+def docker_login(docker_client: "docker.DockerClient", password: str, registry: str, username: str = "AWS") -> None:
+    """Logs in to the Docker registry using the provided credentials (username defaults to 'AWS')."""
+    try:
+        docker_client.login(username=username, password=password, registry=registry)
+    except Exception as e:
+        log_and_exit(LOG_DOCKER_LOGIN.format(e=e))
+
+
+def tag_image(docker_client: "docker.DockerClient", local_image: str, remote_repository: str, image_tag: str) -> None:
+    """Tags the local Docker image for the remote repository."""
+    try:
+        image = docker_client.images.get(local_image)
+        image.tag(remote_repository, tag=image_tag)
+    except Exception as e:
+        log_and_exit(LOG_TAGGING_IMAGE.format(e=e))
+
+
+def push_image(docker_client: "docker.DockerClient", remote_repository: str, image_tag: str) -> None:
+    """Push the Docker image to ECR with a progress bar."""
+    try:
+        print(USER_PUSHING_IMAGE.format(remote_repository=remote_repository, image_tag=image_tag))
+        start_time = time.time()
+        last_display_time = 0
+        layers = {}
+        total_layers = 0
+
+        for line in docker_client.images.push(
+                repository=remote_repository,
+                tag=image_tag,
+                stream=True,
+                decode=True
+        ):
+            current_time = time.time()
+            if 'id' not in line or 'status' not in line:
+                continue
+            layer_id = line.get('id', 'unknown')
+            status = line['status']
+            progress = line.get('progressDetail', {})
+
+            if layer_id not in layers:
+                total_layers += 1
+                layers[layer_id] = {
+                    'status': status,
+                    'current': progress.get('current', 0),
+                    'total': progress.get('total', 0),
+                    'start_time': current_time
+                }
+            else:
+                layers[layer_id].update({
+                    'status': status,
+                    'current': progress.get('current', layers[layer_id]['current']),
+                    'total': progress.get('total', layers[layer_id]['total'])
+                })
+
+            should_update = (
+                current_time - last_display_time >= 0.5 or
+                status in ('Pushed', 'Layer already exists') or
+                (status == 'Pushing' and progress.get('current') == progress.get('total') and progress.get('total', 0) > 0)
+            )
+            if not should_update:
+                continue
+            last_display_time = current_time
+
+            completed = len([layer for layer in layers.values() if layer['status'] in ('Pushed', 'Layer already exists')])
+            overall_progress = completed / total_layers if total_layers > 0 else 0
+            elapsed = current_time - start_time
+            elapsed_str = str(timedelta(seconds=int(elapsed)))
+
+            filled_length = int(PROGRESS_BAR_LENGTH * overall_progress)
+            bar = PROGRESS_BAR_CHAR * filled_length + '-' * (PROGRESS_BAR_LENGTH - filled_length)
+
+            progress_line = PROGRESS_BAR_FORMAT.format(
+                elapsed=elapsed_str,
+                bar=bar,
+                percent=overall_progress * 100,
+                completed=completed,
+                total=total_layers
+            )
+            sys.stdout.write(progress_line)
+            sys.stdout.flush()
+
+            if completed == total_layers:
+                break
+
+        elapsed = time.time() - start_time
+        elapsed_str = str(timedelta(seconds=int(elapsed)))
+        print(SUCCESSFULLY_PUSHED.format(remote_repository=remote_repository, image_tag=image_tag, elapsed_str=elapsed_str))
+
+    except Exception as e:
+        log_and_exit(LOG_DURING_PUSH.format(error=str(e)))
+
+
+def main() -> None:
+    """Main entry point for the ecr-push CLI."""
+    args = parse_args()
+    try:
+        validate_inputs(args)
+    except ValueError as ve:
+        log_and_exit(str(ve))
+
+    docker_client = docker.from_env()
+    ecr_client = get_aws_ecr_client(args.profile)
+
+    ensure_ecr_repository(ecr_client, args.image_name)
+
+    auth_data = get_ecr_auth_token(ecr_client, args.account_number)
+    password = decode_auth_token(auth_data["authorizationToken"])
+    registry = auth_data["proxyEndpoint"]
+    local_image, remote_repository = format_image_names(args.image_name, args.image_tag, registry)
+
+    docker_login(docker_client, password=password, registry=registry)
+    tag_image(docker_client, local_image, remote_repository, args.image_tag)
+    push_image(docker_client, remote_repository, args.image_tag)
+    print(SUCCESSFULLY_PUSHED_FINAL.format(local_image=local_image, remote_repository=remote_repository, image_tag=args.image_tag))
+
+
+if __name__ == "__main__":
+    main()
